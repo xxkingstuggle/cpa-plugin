@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"errors"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -671,11 +672,42 @@ func (r *modelRuntime) commitFeatureRuntime(next *featureRuntimeConfig) uint64 {
 	snapshot := *next
 	snapshot.desensitizeTerms = append([]string(nil), next.desensitizeTerms...)
 	snapshot.configuredModels = append([]string(nil), next.configuredModels...)
+
 	r.configCommitMu.Lock()
+	if current := featureRuntime.Load(); current != nil &&
+		r.configGeneration.Load() != 0 &&
+		featureRuntimeEqual(current, &snapshot) {
+		// No-op reconfigure (e.g. host re-applies the same config after
+		// unrelated auth-file churn such as other plugins refreshing their
+		// tokens): keep the existing configGeneration so ready model
+		// snapshots stay valid and executors never observe a
+		// "model catalog is not ready" window. The FIRST successful commit
+		// (generation 0) always establishes the generation.
+		generation := r.configGeneration.Load()
+		r.configCommitMu.Unlock()
+		return generation
+	}
 	featureRuntime.Store(&snapshot)
 	generation := r.configGeneration.Add(1)
 	r.configCommitMu.Unlock()
 	return generation
+}
+
+// featureRuntimeEqual reports whether two runtime configs are semantically
+// identical. The desensitize matcher is deterministically compiled from
+// desensitizeTerms, so comparing the source fields (terms in order, since
+// term order defines matching precedence) is sufficient; configuredModels
+// order defines catalog order and is compared in order as well.
+func featureRuntimeEqual(a, b *featureRuntimeConfig) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.desensitizeEnabled == b.desensitizeEnabled &&
+		a.desensitizeSource == b.desensitizeSource &&
+		a.oauthClientMode == b.oauthClientMode &&
+		a.enterpriseCredits == b.enterpriseCredits &&
+		slices.Equal(a.desensitizeTerms, b.desensitizeTerms) &&
+		slices.Equal(a.configuredModels, b.configuredModels)
 }
 
 func (r *modelRuntime) advanceConfigGeneration() uint64 {
