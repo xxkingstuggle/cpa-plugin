@@ -190,6 +190,100 @@ func TestPumpUpstreamStreamUsesCPAFrameContract(t *testing.T) {
 	}
 }
 
+func TestPumpUpstreamStreamPreservesToolArgumentFragmentsAndUsage(t *testing.T) {
+	sse := strings.Join([]string{
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"terminal","arguments":"{\"command\":"}}]}}]}`,
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"printf HERMES_FIXTURE_OK\"}"}}]}}]}`,
+		`data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+		`data: {"usage":{"prompt_tokens":11,"completion_tokens":4,"total_tokens":15}}`,
+		`data: [DONE]`,
+	}, "\n\n") + "\n\n"
+	for _, tc := range []struct {
+		name      string
+		sseFramed bool
+	}{
+		{name: "native chat completions"},
+		{name: "cross-format translator", sseFramed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := recordStreamHostCalls(t, nil)
+			setPumpHTTPClient(t, io.NopCloser(strings.NewReader(sse)))
+			pumpUpstreamStream(pumpTestRequest(t), nil, "stream-1", tc.sseFramed, "model", "model", "", time.Now(), "", "")
+
+			var chunks [][]byte
+			for _, call := range *calls {
+				if call.method != pluginabi.MethodHostStreamEmit {
+					continue
+				}
+				var event struct {
+					Payload []byte `json:"payload"`
+					Error   string `json:"error"`
+				}
+				if err := json.Unmarshal(call.body, &event); err != nil {
+					t.Fatal(err)
+				}
+				if event.Error != "" {
+					t.Fatalf("unexpected stream error: %s", event.Error)
+				}
+				chunks = append(chunks, event.Payload)
+			}
+			if len(chunks) != 4 {
+				t.Fatalf("expected two tool deltas, finish, and usage, got %q", chunks)
+			}
+			var toolName, arguments string
+			var promptTokens, completionTokens, totalTokens int
+			for i, payload := range chunks {
+				if tc.sseFramed {
+					if !strings.HasPrefix(string(payload), "data: ") {
+						t.Fatalf("cross-format chunk %d lacks one SSE prefix: %q", i, payload)
+					}
+					payload = []byte(strings.TrimPrefix(string(payload), "data: "))
+				} else if strings.HasPrefix(string(payload), "data:") {
+					t.Fatalf("native chunk %d has an SSE prefix: %q", i, payload)
+				}
+				if !json.Valid(payload) {
+					t.Fatalf("chunk %d is not JSON after host framing: %q", i, payload)
+				}
+				var frame struct {
+					Choices []struct {
+						Delta struct {
+							ToolCalls []struct {
+								Function struct {
+									Name      string `json:"name"`
+									Arguments string `json:"arguments"`
+								} `json:"function"`
+							} `json:"tool_calls"`
+						} `json:"delta"`
+					} `json:"choices"`
+					Usage struct {
+						PromptTokens     int `json:"prompt_tokens"`
+						CompletionTokens int `json:"completion_tokens"`
+						TotalTokens      int `json:"total_tokens"`
+					} `json:"usage"`
+				}
+				if err := json.Unmarshal(payload, &frame); err != nil {
+					t.Fatalf("decode chunk %d: %v", i, err)
+				}
+				for _, choice := range frame.Choices {
+					for _, call := range choice.Delta.ToolCalls {
+						toolName += call.Function.Name
+						arguments += call.Function.Arguments
+					}
+				}
+				if frame.Usage.TotalTokens != 0 {
+					promptTokens, completionTokens, totalTokens = frame.Usage.PromptTokens, frame.Usage.CompletionTokens, frame.Usage.TotalTokens
+				}
+			}
+			if toolName != "terminal" || arguments != `{"command":"printf HERMES_FIXTURE_OK"}` {
+				t.Fatalf("tool fragments changed: name=%q arguments=%q", toolName, arguments)
+			}
+			if promptTokens != 11 || completionTokens != 4 || totalTokens != 15 {
+				t.Fatalf("usage fields changed: prompt=%d completion=%d total=%d", promptTokens, completionTokens, totalTokens)
+			}
+		})
+	}
+}
+
 func TestClientNeedsSSEFrameUsesRequestPathMetadata(t *testing.T) {
 	for _, tc := range []struct {
 		path string
@@ -244,7 +338,8 @@ func TestPumpUpstreamStreamEmitFailureDoesNotEmitSecondError(t *testing.T) {
 	calls := recordStreamHostCalls(t, errors.New("client stream closed"))
 	setPumpHTTPClient(t, io.NopCloser(strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")))
 
-	pumpUpstreamStream(pumpTestRequest(t), nil, "stream-1", false, "model", "model", "", time.Now(), "", "")
+	canceled := false
+	pumpUpstreamStream(pumpTestRequest(t), func() { canceled = true }, "stream-1", false, "model", "model", "", time.Now(), "", "")
 
 	emits := 0
 	for _, call := range *calls {
@@ -257,6 +352,9 @@ func TestPumpUpstreamStreamEmitFailureDoesNotEmitSecondError(t *testing.T) {
 	}
 	if closes := streamCloseCallCount(*calls); closes != 1 {
 		t.Fatalf("stream closes = %d, want 1", closes)
+	}
+	if !canceled {
+		t.Fatal("client stream closure did not cancel the upstream request")
 	}
 }
 
