@@ -133,6 +133,79 @@ func TestPumpUpstreamStreamEmptyUsesNativeErrorAndClosesOnce(t *testing.T) {
 	}
 }
 
+func TestPumpUpstreamStreamUsesCPAFrameContract(t *testing.T) {
+	sse := "data: {\"choices\":[{\"delta\":{\"content\":\"literal data: marker\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	for _, tc := range []struct {
+		name      string
+		sseFramed bool
+		wantFrame bool
+	}{
+		{name: "native chat completions emits raw JSON"},
+		{name: "cross-format keeps one SSE frame", sseFramed: true, wantFrame: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := recordStreamHostCalls(t, nil)
+			setPumpHTTPClient(t, io.NopCloser(strings.NewReader(sse)))
+			pumpUpstreamStream(pumpTestRequest(t), nil, "stream-1", tc.sseFramed, "model", "model", "", time.Now(), "", "")
+
+			var chunks [][]byte
+			for _, call := range *calls {
+				if call.method != pluginabi.MethodHostStreamEmit {
+					continue
+				}
+				var event struct {
+					Payload []byte `json:"payload"`
+					Error   string `json:"error"`
+				}
+				if err := json.Unmarshal(call.body, &event); err != nil {
+					t.Fatal(err)
+				}
+				if event.Error != "" {
+					t.Fatalf("unexpected stream error: %s", event.Error)
+				}
+				chunks = append(chunks, event.Payload)
+			}
+			if len(chunks) != 2 {
+				t.Fatalf("expected two JSON events without upstream [DONE], got %q", chunks)
+			}
+			for i, payload := range chunks {
+				if tc.wantFrame {
+					if !strings.HasPrefix(string(payload), "data: ") {
+						t.Fatalf("cross-format chunk %d lacks one SSE prefix: %q", i, payload)
+					}
+					payload = []byte(strings.TrimPrefix(string(payload), "data: "))
+				} else if strings.HasPrefix(string(payload), "data:") {
+					t.Fatalf("native chunk %d has an SSE prefix: %q", i, payload)
+				}
+				if !json.Valid(payload) {
+					t.Fatalf("chunk %d is not JSON after the expected host framing: %q", i, payload)
+				}
+			}
+			if !strings.Contains(string(chunks[0]), "literal data: marker") {
+				t.Fatalf("JSON text containing data: was modified: %q", chunks[0])
+			}
+		})
+	}
+}
+
+func TestClientNeedsSSEFrameUsesRequestPathMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		path string
+		want bool
+	}{
+		{path: "/v1/chat/completions", want: false},
+		{path: "/v1/completions", want: false},
+		{path: "/v1/responses", want: true},
+		{path: "/v1/messages", want: true},
+	} {
+		if got := clientNeedsSSEFrame(map[string]any{"request_path": tc.path}); got != tc.want {
+			t.Errorf("path %q needs SSE frame = %t, want %t", tc.path, got, tc.want)
+		}
+	}
+}
+
 type readErrorAfterData struct {
 	data []byte
 	err  error
