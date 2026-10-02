@@ -1,5 +1,7 @@
 # CPA 插件仓库
 
+本仓库由 `xxkingstuggle` 自行维护，长期维护分支为 `personal/custom`。源码来源、构建和发布约定见 [MAINTENANCE.md](MAINTENANCE.md)。
+
 [CLIProxyAPI (CPA)](https://github.com/router-for-me/CLIProxyAPI) 插件集合。当前提供 **WorkBuddy / CodeBuddy** 与 **QoderWork (CN)** 两个 OAuth Provider。
 
 ## 插件
@@ -53,10 +55,10 @@ plugins:
 
 ## 远程更新（插件商店自定义源）
 
-CPA 插件商店源添加：
+原作者的插件商店源（2026-10-02 实测返回 404，当前不可用于更新）：
 
 ```text
 https://raw.githubusercontent.com/Sliverkiss/cpa-plugin/main/registry.json
 ```
 
-然后在商店 UI 安装/更新 **workbuddy** 和 **qoderwork**。
+自维护版本目前从源码构建；尚未发布自己的插件商店更新源。不要把原作者的下载地址当作本仓库维护版本。
